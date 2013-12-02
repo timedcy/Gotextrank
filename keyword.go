@@ -2,89 +2,69 @@ package textRank
 
 import (
 	"bufio"
+	"fmt"
 	r "github.com/ggaaooppeenngg/Gommseg"
 	"os"
-	"runtime"
 	"sort"
 )
 
-//获得filePath文档的关键词，这个算法效果不是特别明显，现在主要的分词都是借助机器学习和词典结合的，这里我只用了词典分词
-//top是要获得关键词系数最高的top个单词，如果top大于结果大小就直接返回结果
-//precision是递归条件，设得大递归时间长，效果好些，但个人感觉0.01 或者0.001都够了，因为后面基本就收敛了
-//top key words you want to return
-//precision convergence condition
-func GetKeyswords(filePath string, top int, precision float64) (rts []string) {
-	//初始权重
-	var initialWt float64 = 1
-	//窗体大小，在同一个窗体内的单词就当作有关系
-	//这个可以自己设置
-	var window int = 4
-	//并发数，根据情况设置
-	runtime.GOMAXPROCS(2)
-	var s = new(r.Segmenter)
-	errInit := s.Init("../Godarts/darts.lib")
+var segmenter *r.Segmenter
+var window int = 4
+var initialWt float64 = 1.0
+
+func init() {
+	segmenter = new(r.Segmenter)
+	errInit := segmenter.Init("../Godarts/darts.lib")
 	if errInit != nil {
 		fmt.Println(errInit)
 	}
+}
 
-	offset := 0
-	//切分单词
-	unifile, _ := os.Open(filePath)
-	uniLineReader := bufio.NewReaderSize(unifile, 4000)
-	line, bufErr := uniLineReader.ReadString('\n')
-	words := make([]string, 0, 100)
-	takeWord := func(off int, length int) {
-		if len(line[off-offset:off-offset+length]) > 3 {
-			words = append(words, string(line[off-offset:off-offset+length]))
-		}
-	}
-	for nil == bufErr {
-		s.Mmseg(line[:], offset, takeWord, nil, false)
-		offset += len(line)
-		line, bufErr = uniLineReader.ReadString('\n')
-	}
-	s.Mmseg(line, offset, takeWord, nil, false)
-	//建立单词对点的映射
+func builtGraph(words []string) (map[string]Vertex, *Graph) {
 	graphMap := make(map[string]Vertex)
-	//以点的单词个数建立一个图
 	wordsGraph := NewGraph(len(words))
 	for _, w := range words {
 		_, ok := graphMap[w]
 		if !ok {
-			//去重
 			graphMap[w] = wordsGraph.AddVertex()
 		}
 	}
+	//fmt.Println(graphMap)
 	for i := 0; i < len(words)-window; i++ {
 		for j := i + 1; j < i+window; j++ {
-			//int(1) is the initial weight initialWt
-			has := wordsGraph.HasEdge(graphMap[words[i]], graphMap[words[j]])
+			from := graphMap[words[i]]
+			to := graphMap[words[j]]
+			//fmt.Println(from, to)
+			has := wordsGraph.HasEdge(from, to)
 			if has {
-				wordsGraph.AddEdgeWeight(graphMap[words[i]], graphMap[words[j]], initialWt)
-				wordsGraph.AddEdgeWeight(graphMap[words[j]], graphMap[words[i]], initialWt)
+				wordsGraph.AddEdgeWeight(from, to, initialWt)
+				wordsGraph.AddEdgeWeight(to, from, initialWt)
 			} else {
 				//感觉无向图更适合单词间的关系,所以正反使用了两次,graph是一个有向图,有点别扭的感觉……
-				wordsGraph.AddEdge(graphMap[words[i]], graphMap[words[j]], initialWt)
-				wordsGraph.AddEdge(graphMap[words[j]], graphMap[words[i]], initialWt)
+				wordsGraph.AddEdge(from, to, initialWt)
+				wordsGraph.AddEdge(to, from, initialWt)
 			}
 		}
 	}
-
-	oldScores := make([]float64, wordsGraph.VertexCount(), wordsGraph.VertexCount())
+	//fmt.Println("go")
+	//fmt.Println(wordsGraph)
+	//fmt.Println(graphMap)
+	return graphMap, wordsGraph
+}
+func iterate(graphMap map[string]Vertex, wordsGraph *Graph, precision float64) (rts []string) {
+	m := float64(10000)
+	count := wordsGraph.VertexCount()
+	oldScores := make([]float64, count, count)
 	for i := range oldScores {
 		oldScores[i] = 1
 	}
-	m := float64(10000)
-	//run until convergence
-	for m > float64(precision) {
-		//.85 is the d in TextRank algrithom
-		//也就是中文里的阻尼系数
+	for m > precision {
 		newScores := Iterate(float64(0.85), oldScores, wordsGraph)
-
+		//fmt.Println(oldScores)
 		m = Abs(oldScores, newScores)
 		copy(oldScores, newScores)
 	}
-	pairs := make(IndexScorePairSlice, wordsGraph.VertexCount(), wordsGraph.VertexCount())
+	pairs := make(IndexScorePairSlice, count, count)
 	for i, v := range oldScores {
 		pairs[i] = IndexScorePair{Vertex(i), v}
 	}
@@ -93,14 +73,55 @@ func GetKeyswords(filePath string, top int, precision float64) (rts []string) {
 	for k, v := range graphMap {
 		outMap[v] = k
 	}
-	if top > len(outMap) {
-		rts = make([]string, 0, len(outMap))
-	} else {
-		rts = make([]string, 0, top)
-	}
-
-	for i := 0; i < cap(rts); i++ {
+	rts = make([]string, 0, len(outMap))
+	for i := 0; i < len(outMap); i++ {
 		rts = append(rts, outMap[pairs[i].Index])
 	}
+	return rts
+}
+func GetKeyWords(input string, top int, precision float64) (rts []string) {
+	words := make([]string, 0, 100)
+	takeWord := func(offset, length int) {
+		if len(input[offset:offset+length]) > 3 {
+			words = append(words, input[offset:offset+length])
+			//fmt.Println("go", offset, length, input[offset:offset+length])
+		}
+	}
+	segmenter.Mmseg(input, 0, takeWord, false)
+	graphMap, wordsGraph := builtGraph(words)
+	//fmt.Println(words)
+	results := iterate(graphMap, wordsGraph, precision)
+	if len(results) < top {
+		top = len(results) - 1
+	}
+	rts = results[0:top]
+	return rts
+}
+
+func GetKeyWordsFile(filePath string, top int, precision float64) (rts []string) {
+	offset := 0
+	unifile, _ := os.Open(filePath)
+	uniLineReader := bufio.NewReaderSize(unifile, 4000)
+	line, bufErr := uniLineReader.ReadString('\n')
+	words := make([]string, 0, 100)
+	takeWord := func(off int, length int) {
+		if len(line[off-offset:off-offset+length]) > 3 {
+			words = append(words, string(line[off:off+length]))
+			//fmt.Println(off, length, line[off-offset:off-offset+length])
+		}
+	}
+	for nil == bufErr {
+		segmenter.Mmseg(line[:], offset, takeWord, false)
+		offset += len(line)
+		line, bufErr = uniLineReader.ReadString('\n')
+	}
+	segmenter.Mmseg(line, offset, takeWord, false)
+	graphMap, wordsGraph := builtGraph(words)
+	//fmt.Println(words)
+	results := iterate(graphMap, wordsGraph, precision)
+	if len(results) < top {
+		top = len(results) - 1
+	}
+	rts = results[0:top]
 	return rts
 }
